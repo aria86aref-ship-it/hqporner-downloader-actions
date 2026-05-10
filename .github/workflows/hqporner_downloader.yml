@@ -1,0 +1,174 @@
+# .github/workflows/download_video.yml
+name: HQPorner Video Downloader
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: 'URL of the video on HQPorner'
+        required: true
+        type: string
+      output_folder:
+        description: 'Folder to save the video in repository'
+        required: false
+        type: string
+        default: 'downloads'
+      quality:
+        description: 'Video quality'
+        required: true
+        type: choice
+        options:
+          - '360'
+          - '720'
+          - '1080'
+      archive_base_name:
+        description: 'Filename for the RAR archive parts (e.g., my_favorite_video)'
+        required: false
+        type: string
+        default: 'video'
+
+permissions:
+  contents: write
+
+jobs:
+  download-and-prepare:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install hqporner_api rarfile requests
+          sudo apt-get update
+          sudo apt-get install -y curl unrar rar ffmpeg 
+        shell: bash
+
+      - name: Run video download script
+        env:
+          VIDEO_URL: ${{ github.event.inputs.url }}
+          OUTPUT_FOLDER: ${{ github.event.inputs.output_folder }}
+          VIDEO_QUALITY: ${{ github.event.inputs.quality }}
+          ARCHIVE_BASE_NAME: ${{ github.event.inputs.archive_base_name }}
+        run: |
+          cat << EOF > download_video.py
+          import os
+          import sys
+          import subprocess
+          import shutil
+          try:
+              from hqporner_api import Client
+          except ImportError as e:
+              print(f"Error importing hqporner_api or its dependencies: {e}")
+              print("Please ensure all required libraries and system packages are installed.")
+              sys.exit(1)
+
+          def download_and_prepare_video(url, output_folder, quality='720', archive_base_name='video'):
+              os.makedirs(output_folder, exist_ok=True)
+              print(f"Starting download for URL: {url} with quality: {quality}")
+
+              try:
+                  client = Client()
+                  video_object = client.get_video(url)
+                  video_title = video_object.title
+                  safe_video_title = "".join(c for c in video_title if c.isalnum() or c in (' ', '_')).rstrip()
+                  safe_video_title = safe_video_title.replace(' ', '_')
+
+                  video_object.download(quality=quality, path=output_folder) 
+
+                  actual_downloaded_file = None
+                  list_of_files = [os.path.join(output_folder, f) for f in os.listdir(output_folder)]
+                  if list_of_files:
+                      list_of_files.sort(key=os.path.getmtime, reverse=True)
+                      potential_file = list_of_files[0]
+                      if os.path.isfile(potential_file) and os.path.getsize(potential_file) > 0:
+                          actual_downloaded_file = potential_file
+                      else: 
+                           for fname in os.listdir(output_folder):
+                               if safe_video_title in fname and fname.endswith(('.mp4', '.webm', '.mov')):
+                                    file_mtime = os.path.getmtime(os.path.join(output_folder, fname))
+                                    if abs(file_mtime - os.path.getmtime(potential_file)) < 5: 
+                                        actual_downloaded_file = os.path.join(output_folder, fname)
+                                        break
+                  
+                  if not actual_downloaded_file:
+                      raise FileNotFoundError("Could not locate the downloaded video file after download.")
+                  
+                  print(f"Video downloaded successfully to: {actual_downloaded_file}")
+
+                  file_size_bytes = os.path.getsize(actual_downloaded_file)
+                  file_size_mb = file_size_bytes / (1024 * 1024)
+                  print(f"File size: {file_size_mb:.2f} MB")
+
+                  if file_size_mb > 99.0:
+                      print(f"File size exceeds 99MB. Splitting into RAR archives...")
+                      base_name_no_ext = os.path.splitext(archive_base_name)[0]
+                      
+                      rar_output_prefix = os.path.join(output_folder, f"{base_name_no_ext}.rar")
+
+                      # Use 'rar' command here for creating archives
+                      rar_command = [
+                          'rar', 'a', '-m0', '-v95m', 
+                          rar_output_prefix, 
+                          actual_downloaded_file
+                      ]
+                      subprocess.run(rar_command, check=True)
+                      print("RAR splitting complete.")
+                      os.remove(actual_downloaded_file)
+                      print(f"Removed original file: {actual_downloaded_file}")
+                  else:
+                      print("File size is 99MB or less. No splitting required.")
+                      current_filename = os.path.basename(actual_downloaded_file)
+                      desired_name_part = f"{archive_base_name}"
+                      if not current_filename.startswith(desired_name_part):
+                           new_filename = f"{archive_base_name}{os.path.splitext(current_filename)[1]}"
+                           new_filepath = os.path.join(output_folder, new_filename)
+                           shutil.move(actual_downloaded_file, new_filepath)
+                           print(f"Renamed non-split file to: {new_filepath}")
+                          
+              except Exception as e:
+                  print(f"An error occurred during download or preparation: {e}")
+                  sys.exit(1)
+
+          if __name__ == "__main__":
+              input_url = os.environ.get('VIDEO_URL')
+              output_dir = os.environ.get('OUTPUT_FOLDER')
+              input_quality = os.environ.get('VIDEO_QUALITY')
+              input_archive_name = os.environ.get('ARCHIVE_BASE_NAME')
+              
+              if not all([input_url, output_dir, input_quality, input_archive_name]):
+                  print("Error: One or more required environment variables are missing.")
+                  print(f"VIDEO_URL: {input_url}")
+                  print(f"OUTPUT_FOLDER: {output_dir}")
+                  print(f"VIDEO_QUALITY: {input_quality}")
+                  print(f"ARCHIVE_BASE_NAME: {input_archive_name}") 
+                  sys.exit(1)
+                  
+              download_and_prepare_video(input_url, output_dir, input_quality, input_archive_name)
+          EOF
+          
+          python download_video.py
+        shell: bash
+
+      - name: Commit and push artifacts
+        run: |
+          git config --global user.name 'github-actions[bot]'
+          git config --global user.email 'github-actions[bot]@users.noreply.github.com'
+          
+          git add ${{ github.event.inputs.output_folder }}/*
+          
+          if git diff --staged --quiet; then
+            echo "No changes to commit."
+          else
+            git commit -m "Automated video download: ${{ github.event.inputs.archive_base_name }}"
+            git push origin HEAD:${{ github.ref }}
+          fi
+        shell: bash
